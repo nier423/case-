@@ -1,0 +1,30 @@
+# 依赖目录
+node_modules/
+*/node_modules/
+
+# 环境变量（包含 API 密钥）
+.env
+backend/.env
+
+# Node.js 运行时（便携版）
+node-v20.11.1-win-x64/
+node.zip
+
+# 截图文件（运行时生成）
+backend/screenshots/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE 配置
+.vscode/
+.idea/
+
+# 日志
+*.log
+npm-debug.log*
+
+# 构建产物
+dist/
+build/
