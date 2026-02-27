@@ -102,32 +102,61 @@ export async function analyzeWithCoder(prompt, code) {
   const apiKey = process.env.DASHSCOPE_API_KEY;
   const model = process.env.QWEN_CODER_MODEL || 'qwen-plus';
   
+  if (!apiKey) {
+    throw new Error('DASHSCOPE_API_KEY 未配置，请在 .env 文件中设置');
+  }
+  
   const systemPrompt = `你是一个专业的网页功能分析专家。你必须严格按照提供的 Skills 规则来识别功能点，不能随意发挥。
 输出必须是纯 JSON 格式，不要包含任何其他内容、解释或 markdown 代码块。`;
   
-  const response = await fetch(API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model: model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: `${prompt}\n\n代码内容：\n${code}` }
-      ],
-      temperature: 0,
-      seed: 42
-    })
-  });
+  // 限制代码长度，避免 API 超时
+  const maxCodeLength = 50000;
+  const truncatedCode = code.length > maxCodeLength 
+    ? code.substring(0, maxCodeLength) + '\n... (代码已截断)' 
+    : code;
   
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`AI API 调用失败: ${error}`);
+  console.log(`[AI调用] 使用模型: ${model}, 代码长度: ${truncatedCode.length} 字符`);
+  
+  let response;
+  try {
+    response = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `${prompt}\n\n代码内容：\n${truncatedCode}` }
+        ],
+        temperature: 0,
+        seed: 42
+      })
+    });
+  } catch (e) {
+    throw new Error(`网络请求失败: ${e.message}`);
   }
   
-  const data = await response.json();
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('[AI调用] API 错误响应:', errorText.substring(0, 500));
+    throw new Error(`AI API 调用失败 (${response.status}): ${errorText.substring(0, 200)}`);
+  }
+  
+  let data;
+  try {
+    data = await response.json();
+  } catch (e) {
+    throw new Error(`API 响应解析失败: ${e.message}`);
+  }
+  
+  if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+    console.error('[AI调用] 响应格式异常:', JSON.stringify(data).substring(0, 500));
+    throw new Error('API 响应格式异常，缺少 choices 或 message');
+  }
+  
   return data.choices[0].message.content;
 }
 
@@ -205,10 +234,16 @@ ${FEATURE_IDENTIFICATION_RULES}
 
 直接输出 JSON 数组，不要任何其他内容：`;
 
-  const response = await analyzeWithCoder(prompt, html);
+  let response;
+  try {
+    response = await analyzeWithCoder(prompt, html);
+  } catch (e) {
+    console.error('[AI调用] 功能点识别 API 调用失败:', e.message);
+    throw new Error(`AI API 调用失败: ${e.message}`);
+  }
   
   console.log('[AI响应] 功能点识别:');
-  console.log(response.substring(0, 800) + (response.length > 800 ? '...' : ''));
+  console.log(response.substring(0, 1000) + (response.length > 1000 ? '...' : ''));
   
   // 解析 JSON
   try {
@@ -218,24 +253,97 @@ ${FEATURE_IDENTIFICATION_RULES}
     const codeBlockMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (codeBlockMatch) {
       jsonStr = codeBlockMatch[1].trim();
+      console.log('[AI解析] 移除 markdown 代码块后:', jsonStr.substring(0, 200));
     }
     
-    // 提取 JSON 数组
-    const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
-    if (jsonMatch) {
-      const features = JSON.parse(jsonMatch[0]);
+    // 尝试直接解析整个响应（可能是纯 JSON）
+    let features = null;
+    try {
+      const directParse = JSON.parse(jsonStr);
+      if (Array.isArray(directParse)) {
+        features = directParse;
+        console.log('[AI解析] 直接解析成功，是数组');
+      } else if (directParse.features && Array.isArray(directParse.features)) {
+        features = directParse.features;
+        console.log('[AI解析] 直接解析成功，提取 features 字段');
+      }
+    } catch (e) {
+      // 直接解析失败，继续尝试提取 JSON 数组
+    }
+    
+    // 如果直接解析失败，尝试提取 JSON 数组
+    if (!features) {
+      const jsonMatch = jsonStr.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        try {
+          features = JSON.parse(jsonMatch[0]);
+          console.log('[AI解析] 通过正则提取 JSON 数组成功');
+        } catch (e) {
+          console.error('[AI解析] 正则提取的 JSON 解析失败:', e.message);
+        }
+      }
+    }
+    
+    if (features && Array.isArray(features)) {
       console.log(`[AI解析] 识别到 ${features.length} 个功能点:`);
       features.forEach((f, i) => console.log(`  ${i + 1}. ${f.name} (${f.type}) - ${f.selector}`));
       return features;
     }
     
-    console.log('[AI解析] 未找到有效的JSON数组');
+    console.log('[AI解析] 未找到有效的JSON数组，返回空');
+    console.log('[AI解析] 原始响应:', response.substring(0, 500));
     return [];
   } catch (e) {
     console.error('[AI解析] 解析失败:', e.message);
-    console.error('原始响应前200字符:', response.substring(0, 200));
+    console.error('[AI解析] 原始响应前500字符:', response.substring(0, 500));
     return [];
   }
+}
+
+/**
+ * 备用方案：使用正则匹配识别功能点
+ * 当 AI 识别失败时使用
+ */
+export function identifyFeaturesFallback(html) {
+  console.log('[Fallback] 使用正则匹配识别功能点...');
+  const features = [];
+  let id = 0;
+  
+  // 匹配按钮
+  const buttonRegex = /<button[^>]*>([^<]*)<\/button>/gi;
+  let match;
+  while ((match = buttonRegex.exec(html)) !== null) {
+    const text = match[1].trim();
+    if (text) {
+      id++;
+      features.push({
+        id: `feat_${id}`,
+        name: text,
+        type: 'button',
+        selector: `button:has-text("${text}")`,
+        expectedBehavior: `点击"${text}"按钮应有相应响应`
+      });
+    }
+  }
+  
+  // 匹配带 onclick 的元素
+  const onclickRegex = /<[^>]*onclick=["']([^"']*)["'][^>]*>([^<]*)<\/[^>]*>/gi;
+  while ((match = onclickRegex.exec(html)) !== null) {
+    const text = match[2].trim();
+    if (text && !features.find(f => f.name === text)) {
+      id++;
+      features.push({
+        id: `feat_${id}`,
+        name: text,
+        type: 'button',
+        selector: `[onclick]:has-text("${text}")`,
+        expectedBehavior: `点击"${text}"应有相应响应`
+      });
+    }
+  }
+  
+  console.log(`[Fallback] 识别到 ${features.length} 个功能点`);
+  return features;
 }
 
 /**
@@ -298,5 +406,112 @@ ${L3_DETECTION_STANDARDS}
   } catch (e) {
     console.error('[L3解析] 失败:', e.message);
     return { pass: false, reason: '解析失败: ' + e.message, suggestion: null };
+  }
+}
+
+/**
+ * 使用视觉模型进行 L4 布局质量深度检测
+ * 调用：qwen-vl-plus（视觉模型）
+ * 用途：检测程序化方法无法识别的视觉问题（遮挡、重叠、布局异常、文字乱码等）
+ */
+export async function analyzeLayoutWithVision(screenshotBase64, programmaticIssues = []) {
+  const apiKey = process.env.DASHSCOPE_API_KEY;
+  const model = process.env.QWEN_VL_MODEL || 'qwen-vl-plus';
+  
+  if (!apiKey) {
+    throw new Error('DASHSCOPE_API_KEY 未配置');
+  }
+
+  const issuesSummary = programmaticIssues.length > 0 
+    ? `\n程序化检测已发现以下问题：\n${programmaticIssues.map(i => `- ${i.type}: ${i.reason}`).join('\n')}`
+    : '';
+
+  const prompt = `请分析这张网页截图的布局质量，检测以下问题：
+
+## 检测项目
+
+1. **元素遮挡**：检查是否有重要内容（文字、图表数据）被其他元素遮挡
+2. **图表完整性**：检查图表（柱状图、饼图、折线图等）是否显示完整，数据是否被裁切
+3. **图例位置**：检查图例是否遮挡了图表数据区域
+4. **文字渲染**：检查是否有文字显示异常、乱码、截断
+5. **布局合理性**：检查元素排列是否合理，是否有明显的错位或重叠
+6. **内容可见性**：检查重要内容是否完整可见${issuesSummary}
+
+## 输出要求
+
+请以 JSON 格式返回分析结果：
+{
+  "hasIssues": true或false,
+  "issues": [
+    {
+      "type": "问题类型（overlap/truncated/misaligned/garbled/incomplete）",
+      "element": "问题元素描述",
+      "description": "具体问题描述",
+      "severity": "严重程度（high/medium/low）",
+      "location": "问题位置描述"
+    }
+  ],
+  "summary": "整体布局质量评价（一句话总结）"
+}
+
+只返回 JSON，不要其他内容：`;
+
+  console.log(`[L4-Vision] 调用视觉模型分析布局质量...`);
+  
+  try {
+    const response = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          { 
+            role: 'system', 
+            content: '你是一个专业的UI测试专家，擅长发现网页布局中的视觉问题。你的判断要准确、客观，基于截图中可见的证据。' 
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: prompt },
+              { type: 'image_url', image_url: { url: `data:image/png;base64,${screenshotBase64}` } }
+            ]
+          }
+        ],
+        temperature: 0,
+        seed: 42
+      })
+    });
+    
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Vision API 调用失败: ${error}`);
+    }
+    
+    const data = await response.json();
+    const content = data.choices[0].message.content;
+    
+    console.log('[L4-Vision] 视觉模型响应:', content.substring(0, 500));
+    
+    // 解析 JSON
+    let jsonStr = content.trim();
+    const codeBlockMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (codeBlockMatch) {
+      jsonStr = codeBlockMatch[1].trim();
+    }
+    
+    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const result = JSON.parse(jsonMatch[0]);
+      console.log(`[L4-Vision] 分析完成: ${result.hasIssues ? '发现问题' : '无问题'}`);
+      return result;
+    }
+    
+    return { hasIssues: false, issues: [], summary: '无法解析视觉模型响应' };
+  } catch (e) {
+    console.error('[L4-Vision] 视觉分析失败:', e.message);
+    return { hasIssues: false, issues: [], summary: `视觉分析失败: ${e.message}`, error: e.message };
   }
 }

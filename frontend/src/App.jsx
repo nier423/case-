@@ -1,18 +1,38 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
 function App() {
   const [activeTab, setActiveTab] = useState('url')
   const [url, setUrl] = useState('')
   const [html, setHtml] = useState('')
-  const [files, setFiles] = useState([]) // 改为数组支持多文件
+  const [files, setFiles] = useState([])
   const [loading, setLoading] = useState(false)
   const [progress, setProgress] = useState(0)
   const [progressText, setProgressText] = useState('')
   const [report, setReport] = useState(null)
-  const [reports, setReports] = useState([]) // 批量检测报告列表
+  const [reports, setReports] = useState([])
   const [expandedFeatures, setExpandedFeatures] = useState({})
-  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 }) // 批量进度
-  const [totalDuration, setTotalDuration] = useState(null) // 总耗时
+  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 })
+  const [totalDuration, setTotalDuration] = useState(null)
+  const [queueStatus, setQueueStatus] = useState(null) // 队列状态
+  const [expandedL4, setExpandedL4] = useState(false) // L4 展开状态
+
+  // 轮询队列状态
+  useEffect(() => {
+    const fetchQueueStatus = async () => {
+      try {
+        const res = await fetch('/api/queue/status')
+        if (res.ok) {
+          const data = await res.json()
+          setQueueStatus(data)
+        }
+      } catch (e) {
+        // 忽略错误
+      }
+    }
+    fetchQueueStatus()
+    const interval = setInterval(fetchQueueStatus, 3000)
+    return () => clearInterval(interval)
+  }, [])
 
   const handleDetect = async () => {
     setLoading(true)
@@ -22,11 +42,12 @@ function App() {
     setExpandedFeatures({})
     setTotalDuration(null)
     setBatchProgress({ current: 0, total: 0 })
+    setExpandedL4(false)
 
     const startTime = Date.now()
 
     try {
-      // 批量 URL 检测
+      // 批量 URL 检测 - 使用批量接口
       if (activeTab === 'url') {
         const urls = url.split('\n').map(u => u.trim()).filter(u => u.length > 0)
         
@@ -35,39 +56,51 @@ function App() {
         }
 
         setBatchProgress({ current: 0, total: urls.length })
-        const batchReports = []
+        setProgress(10)
+        setProgressText(`正在提交 ${urls.length} 个检测任务...`)
 
-        for (let i = 0; i < urls.length; i++) {
-          const currentUrl = urls[i]
-          setBatchProgress({ current: i + 1, total: urls.length })
-          setProgress(Math.round(((i + 0.5) / urls.length) * 100))
-          setProgressText(`正在检测 (${i + 1}/${urls.length}): ${currentUrl.substring(0, 50)}...`)
-
-          const response = await fetch('/api/detect/url', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: currentUrl })
+        // 使用批量检测 API
+        const response = await fetch('/api/detect/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            items: urls.map(u => ({ type: 'url', data: u }))
           })
+        })
 
-          if (!response.ok) {
-            const error = await response.json()
-            batchReports.push({
-              source: currentUrl,
-              error: error.error || '检测失败',
+        setProgress(50)
+        setProgressText('正在等待检测结果...')
+
+        let result
+        try {
+          const text = await response.text()
+          result = text ? JSON.parse(text) : null
+        } catch (e) {
+          throw new Error(`响应解析失败: ${e.message}`)
+        }
+
+        if (!response.ok || !result) {
+          throw new Error(result?.error || `检测失败 (HTTP ${response.status})`)
+        }
+
+        // 解析批量结果
+        const batchReports = result.results.map((r, i) => {
+          if (r.status === 'fulfilled' && r.result) {
+            return r.result
+          } else {
+            return {
+              source: urls[i],
+              error: r.error || '检测失败',
               timestamp: new Date().toISOString(),
               features: [],
               summary: { total: 0, passed: 0, failed: 0, passRate: 0 }
-            })
-          } else {
-            const result = await response.json()
-            batchReports.push(result)
+            }
           }
+        })
 
-          setReports([...batchReports])
-          setProgress(Math.round(((i + 1) / urls.length) * 100))
-        }
+        setReports(batchReports)
+        setBatchProgress({ current: urls.length, total: urls.length })
 
-        // 如果只有一个 URL，设置单个报告
         if (batchReports.length === 1) {
           setReport(batchReports[0])
         }
@@ -85,15 +118,20 @@ function App() {
         setProgress(50)
         setProgressText('正在分析功能点...')
 
-        if (!response.ok) {
-          const error = await response.json()
-          throw new Error(error.error || '检测失败')
+        let result
+        try {
+          const text = await response.text()
+          result = text ? JSON.parse(text) : null
+        } catch (e) {
+          throw new Error(`响应解析失败: ${e.message}`)
+        }
+
+        if (!response.ok || !result) {
+          throw new Error(result?.error || `检测失败 (HTTP ${response.status})`)
         }
 
         setProgress(90)
         setProgressText('正在生成详细报告...')
-
-        const result = await response.json()
         setReport(result)
         setReports([result])
 
@@ -115,17 +153,23 @@ function App() {
             body: formData
           })
 
-          if (!response.ok) {
-            const error = await response.json()
+          let result
+          try {
+            const text = await response.text()
+            result = text ? JSON.parse(text) : null
+          } catch (e) {
+            result = null
+          }
+
+          if (!response.ok || !result) {
             batchReports.push({
               source: currentFile.name,
-              error: error.error || '检测失败',
+              error: result?.error || `检测失败 (HTTP ${response.status})`,
               timestamp: new Date().toISOString(),
               features: [],
               summary: { total: 0, passed: 0, failed: 0, passRate: 0 }
             })
           } else {
-            const result = await response.json()
             result.source = currentFile.name // 用文件名作为来源
             batchReports.push(result)
           }
@@ -172,6 +216,32 @@ function App() {
       {/* Header */}
       <header className="header">
         <h1>Case 质量检测工具</h1>
+        {/* 队列状态指示器 */}
+        {queueStatus && (
+          <div style={{ 
+            fontSize: '0.8rem', 
+            color: 'var(--text-muted)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem'
+          }}>
+            <span style={{ 
+              width: '8px', 
+              height: '8px', 
+              borderRadius: '50%', 
+              background: queueStatus.running > 0 ? '#28a745' : '#6c757d',
+              display: 'inline-block'
+            }} />
+            {queueStatus.running > 0 ? (
+              <span>运行中: {queueStatus.running}/{queueStatus.maxConcurrent}</span>
+            ) : (
+              <span>空闲</span>
+            )}
+            {queueStatus.waiting > 0 && (
+              <span style={{ color: '#ffc107' }}>排队: {queueStatus.waiting}</span>
+            )}
+          </div>
+        )}
       </header>
 
       {/* Input Card */}
@@ -528,6 +598,134 @@ function App() {
               </div>
             ))}
           </div>
+
+          {/* L4 布局质量检测结果 */}
+          {report.layoutQuality && (
+            <div style={{ marginTop: '2rem' }}>
+              <div 
+                style={{ 
+                  display: 'flex', 
+                  justifyContent: 'space-between', 
+                  alignItems: 'center',
+                  padding: '1rem',
+                  background: report.layoutQuality.pass ? 'rgba(26, 55, 77, 0.05)' : 'rgba(220, 53, 69, 0.1)',
+                  borderRadius: '8px',
+                  cursor: 'pointer'
+                }}
+                onClick={() => setExpandedL4(!expandedL4)}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span style={{ 
+                    fontSize: '1.2rem', 
+                    color: report.layoutQuality.pass ? 'var(--navy)' : 'var(--red-pop)' 
+                  }}>
+                    {report.layoutQuality.pass ? '✓' : '✗'}
+                  </span>
+                  <span style={{ fontWeight: 'bold' }}>L4 布局质量检测</span>
+                  {report.layoutQuality.issues?.length > 0 && (
+                    <span style={{ 
+                      background: 'var(--red-pop)', 
+                      color: 'white', 
+                      padding: '0.2rem 0.5rem', 
+                      borderRadius: '10px',
+                      fontSize: '0.8rem'
+                    }}>
+                      {report.layoutQuality.issues.length} 个问题
+                    </span>
+                  )}
+                </div>
+                <span style={{ opacity: 0.5 }}>▼</span>
+              </div>
+
+              {expandedL4 && (
+                <div style={{ 
+                  padding: '1rem', 
+                  border: '1px solid var(--border-color)', 
+                  borderTop: 'none',
+                  borderRadius: '0 0 8px 8px' 
+                }}>
+                  {report.layoutQuality.issues?.length === 0 ? (
+                    <div style={{ color: 'var(--navy)', textAlign: 'center', padding: '1rem' }}>
+                      ✓ 未发现布局问题，页面布局正常
+                    </div>
+                  ) : (
+                    <div>
+                      <div style={{ marginBottom: '1rem', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                        发现以下布局问题：
+                      </div>
+                      {report.layoutQuality.issues.map((issue, idx) => (
+                        <div key={idx} style={{ 
+                          padding: '0.75rem', 
+                          marginBottom: '0.5rem',
+                          background: issue.severity === 'high' ? 'rgba(220, 53, 69, 0.1)' : 
+                                      issue.severity === 'medium' ? 'rgba(255, 193, 7, 0.1)' : 
+                                      'rgba(108, 117, 125, 0.1)',
+                          borderRadius: '6px',
+                          borderLeft: `3px solid ${issue.severity === 'high' ? 'var(--red-pop)' : 
+                                                    issue.severity === 'medium' ? '#ffc107' : '#6c757d'}`
+                        }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.25rem' }}>
+                            <span style={{ fontWeight: 'bold', fontSize: '0.9rem' }}>
+                              {issue.type === 'text_truncated' && '📝 文字截断'}
+                              {issue.type === 'element_covered' && '🔒 元素遮挡'}
+                              {issue.type === 'legend_overlap_chart' && '📊 图例重叠'}
+                              {issue.type === 'chart_clipped' && '✂️ 图表裁切'}
+                              {issue.type === 'chart_distorted' && '📐 图表变形'}
+                              {issue.type === 'element_overflow' && '↔️ 元素溢出'}
+                              {issue.type === 'overflow' && '➡️ 内容溢出'}
+                              {!['text_truncated', 'element_covered', 'legend_overlap_chart', 'chart_clipped', 'chart_distorted', 'element_overflow', 'overflow'].includes(issue.type) && `⚠️ ${issue.type}`}
+                            </span>
+                            <span style={{ 
+                              fontSize: '0.75rem', 
+                              padding: '0.1rem 0.4rem',
+                              borderRadius: '4px',
+                              background: issue.severity === 'high' ? 'var(--red-pop)' : 
+                                          issue.severity === 'medium' ? '#ffc107' : '#6c757d',
+                              color: issue.severity === 'medium' ? '#000' : '#fff'
+                            }}>
+                              {issue.severity === 'high' ? '高' : issue.severity === 'medium' ? '中' : '低'}
+                            </span>
+                          </div>
+                          <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                            {issue.reason || issue.description}
+                          </div>
+                          {issue.element && (
+                            <div style={{ fontSize: '0.8rem', color: 'var(--navy)', marginTop: '0.25rem' }}>
+                              元素: {issue.element}
+                            </div>
+                          )}
+                          {issue.location && (
+                            <div style={{ fontSize: '0.8rem', color: '#888', marginTop: '0.15rem' }}>
+                              位置: {issue.location}
+                            </div>
+                          )}
+                          {issue.source === 'vision' && (
+                            <div style={{ fontSize: '0.75rem', color: '#6c757d', marginTop: '0.25rem', fontStyle: 'italic' }}>
+                              (由视觉模型检测)
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* 视觉分析摘要 */}
+                  {report.layoutQuality.visionAnalysis?.summary && (
+                    <div style={{ 
+                      marginTop: '1rem', 
+                      padding: '0.75rem', 
+                      background: 'rgba(26, 55, 77, 0.05)',
+                      borderRadius: '6px',
+                      fontSize: '0.9rem'
+                    }}>
+                      <span style={{ fontWeight: 'bold' }}>🤖 AI 分析总结：</span>
+                      <span style={{ marginLeft: '0.5rem' }}>{report.layoutQuality.visionAnalysis.summary}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

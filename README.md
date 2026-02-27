@@ -14,11 +14,12 @@
 | 特性 | 说明 |
 |------|------|
 | 🤖 **AI 驱动** | 集成阿里云百炼 API，自动识别功能点并判断执行结果 |
-| 🎯 **L3 级检测** | 不仅验证元素存在，还执行真实点击验证功能是否正常 |
-| 📊 **程序化检测** | L3 采用程序化为主 + AI 辅助，监听网络请求、URL 变化等 |
-| 🖼️ **L4 布局检测** | 检测文字遮挡、截断、溢出等 UI 布局质量问题 |
+| 🎯 **L1-L4 四级检测** | 从元素存在性到视觉布局的完整质量检测 |
+| 📊 **程序化优先** | 功能点识别和 L3 检测均支持纯程序化模式，无需依赖 AI |
+| 🖼️ **L4 视觉检测** | 检测元素遮挡、图表裁切、图例重叠、文字截断等布局问题 |
+| 🚀 **并发控制** | 任务队列管理，支持批量检测，防止资源耗尽 |
 | 📝 **详细报告** | 生成结构化检测报告，包含通过率、失败原因、修复建议 |
-| 🌐 **多种输入** | 支持 URL 链接、HTML 代码粘贴、文件上传三种方式 |
+| 🌐 **多种输入** | 支持 URL 链接、HTML 代码粘贴、文件上传（支持批量） |
 
 ---
 
@@ -94,17 +95,28 @@ Step 1                    Step 2                    Step 3                    St
 页面加载完成
     │
     ▼
-程序化布局检测
-├─ checkTextTruncation()   → 检测文字截断
-├─ checkElementOverlap()   → 检测元素遮挡
-└─ checkOverflow()          → 检测内容溢出
+程序化布局检测（阶段1：~100ms）
+├─ checkTextTruncation()    → 检测文字截断
+├─ checkElementOverlap()    → 检测元素遮挡（多点采样）
+├─ checkOverflow()          → 检测内容溢出
+├─ checkChartCompleteness() → 检测图表完整性（SVG/Canvas裁切）
+├─ checkBoundaryOverflow()  → 检测边界溢出
+└─ 检测图例与图表重叠
+    │
+    ▼
+视觉模型分析（阶段2：可选，~3s）
+└─ qwen-vl-plus 深度分析截图
+   ├─ 发现程序化漏检的问题
+   └─ 检测文字乱码、布局美观性
     │
     ▼
 问题分类
-├─ 文字遮挡（z-index问题）  → severity: high
-├─ 文字截断（overflow问题）→ severity: medium
-├─ 元素溢出（超出视口）    → severity: low
-└─ 层叠错乱               → AI 视觉补充分析
+├─ 🔒 元素遮挡         → severity: high
+├─ 📊 图例重叠图表      → severity: high
+├─ ✂️ 图表裁切         → severity: high
+├─ 📝 文字截断         → severity: medium
+├─ 📐 图表变形         → severity: medium
+└─ ↔️ 内容溢出         → severity: low
     │
     ▼
 汇总问题列表 → 生成修复建议
@@ -141,10 +153,28 @@ npm install
 在 `backend` 目录创建 `.env` 文件：
 
 ```env
+# AI API 配置
 DASHSCOPE_API_KEY=your_api_key_here
 QWEN_CODER_MODEL=qwen-plus
 QWEN_VL_MODEL=qwen-vl-plus
+
+# 服务配置
 PORT=3001
+
+# ===== 增强功能配置 =====
+
+# 最大并发检测任务数（建议 2-5，取决于服务器内存）
+MAX_CONCURRENT_TASKS=3
+
+# 功能点识别模式
+# true  = 使用 AI 识别（qwen-plus，准确但需要 2-3s）
+# false = 使用程序化识别（快速稳定，<100ms）
+USE_AI_IDENTIFICATION=false
+
+# L4 视觉分析开关
+# true  = 启用视觉模型深度分析（检测文字乱码、布局异常等）
+# false = 仅使用程序化检测（快速，覆盖大部分场景）
+L4_VISION_ANALYSIS=true
 ```
 
 ### 4. 启动服务
@@ -198,6 +228,19 @@ case-质量检测/
 | **视频播放** | 检测 video.paused | paused=false 即通过 |
 | **重置** | 对比表单字段值 | 字段恢复即通过 |
 | **表单提交** | 监听 POST/PUT 请求 | 2xx 响应即通过 |
+
+---
+
+## 🔌 API 接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/detect/url` | POST | URL 方式检测 |
+| `/api/detect/html` | POST | HTML 代码检测 |
+| `/api/detect/file` | POST | 文件上传检测 |
+| `/api/detect/batch` | POST | 批量检测（最多 20 个） |
+| `/api/queue/status` | GET | 查看任务队列状态 |
+| `/api/health` | GET | 健康检查
 
 ---
 
